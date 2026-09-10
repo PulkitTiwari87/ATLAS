@@ -129,13 +129,24 @@ class GrpcWorkerClient:
 
     def _heartbeat_loop(self, interval_seconds: float) -> None:
         while True:
+            timestamp = datetime.now(timezone.utc)
             try:
                 self._stub.Heartbeat(
                     atlas_pb2.HeartbeatRequest(
-                        worker_id=str(self.runtime.worker.id),
-                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        worker_id=str(self.runtime.worker.id), timestamp=timestamp.isoformat()
                     )
                 )
+                # Mirror WorkerRuntime.send_heartbeat()'s local-path behavior
+                # (Phase 04/07): keep this process's own Worker object's
+                # last_heartbeat in sync with what was just sent over the
+                # wire. Without this, WorkerRuntime._assign()/_finish()'s
+                # own WorkerRepository.update() calls -- which write this
+                # exact object as a full row, last_heartbeat included --
+                # would overwrite the DB's real heartbeat with this
+                # object's stale None the moment the worker claims its
+                # first task, making it look instantly dead to
+                # FailureDetector.
+                self.runtime.worker.last_heartbeat = timestamp
             except grpc.RpcError:
                 logger.exception("Heartbeat RPC failed for worker %s", self.runtime.worker.id)
             if self._heartbeat_stop.wait(interval_seconds):
