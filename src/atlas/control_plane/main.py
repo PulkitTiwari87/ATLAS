@@ -77,11 +77,14 @@ def _grant_worker_privileges() -> None:
     A local/non-Docker deployment without that role is not an error."""
     if not _GRANT_SQL_PATH.exists():
         return
-    statements = [
-        stmt.strip()
-        for stmt in _GRANT_SQL_PATH.read_text().split(";")
-        if stmt.strip() and not stmt.strip().startswith("--")
+    # Strip whole comment lines *before* splitting on ";" -- one of this
+    # file's own comments contains a literal semicolon mid-sentence
+    # ("...then; see..."), so splitting first would cut a comment in half
+    # and feed the back half to Postgres as a statement.
+    sql_lines = [
+        line for line in _GRANT_SQL_PATH.read_text().splitlines() if not line.strip().startswith("--")
     ]
+    statements = [stmt.strip() for stmt in "\n".join(sql_lines).split(";") if stmt.strip()]
     try:
         with _engine.begin() as conn:
             for statement in statements:

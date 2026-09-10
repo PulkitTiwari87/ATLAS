@@ -1,6 +1,9 @@
 # ADR-001 – Control Plane Architecture
 
-**Status:** Proposed
+**Status:** Accepted — implemented in `atlas.control_plane.main`, which
+composes the REST API, gRPC server, Scheduler/Dispatcher (via
+`DispatchLoop`), `FailureDetector`, and `RecoveryManager` as one process
+around a single shared `GrpcWorkerRegistry`.
 
 ## Context
 

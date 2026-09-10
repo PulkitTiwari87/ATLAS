@@ -40,6 +40,12 @@ SCHEDULE → EXECUTE → DETECT → RECOVER
 
 ## Architecture
 
+The control plane runs as **one process** (`atlas.control_plane.main`):
+the gRPC server's `GrpcWorkerRegistry` is in-process state, so it and
+everything that dispatches through it (Scheduler, Dispatcher,
+FailureDetector, RecoveryManager) must share that one instance — see
+ADR-001. It also serves the REST API.
+
 ```mermaid
 flowchart TB
     Client["Client"]
@@ -399,17 +405,37 @@ cd ATLAS
 
 ---
 
-## 2. Start PostgreSQL
+## 2. Run the full stack with Docker Compose
 
 ```bash
-docker compose up -d postgres
+docker compose up --build
 ```
+
+This starts three services:
+
+- **postgres** — PostgreSQL 15, the durable source of truth.
+- **control-plane** — the one process that owns the shared
+  `GrpcWorkerRegistry` and runs the REST API (`:8000`), the gRPC server
+  (`:50051`), `DispatchLoop` (Scheduler + Dispatcher), `FailureDetector`,
+  and `RecoveryManager`. On startup it runs `alembic upgrade head` and
+  grants the least-privilege `atlas_worker` role its table privileges —
+  no manual migration step needed for a fresh deployment.
+- **worker-1** — a gRPC worker process that registers with the control
+  plane and executes dispatched tasks, connecting to PostgreSQL as the
+  restricted `atlas_worker` role.
 
 Verify:
 
 ```bash
 docker compose ps
+curl http://localhost:8000/health
 ```
+
+`GrpcWorkerRegistry` is in-process state, so the gRPC server and everything
+that dispatches through it (Scheduler, Dispatcher, FailureDetector,
+RecoveryManager) must run in that same process — see `atlas.control_plane.main`
+and ADR-001. Running only PostgreSQL this way (`docker compose up -d postgres`)
+is still useful for local, non-Docker development against the steps below.
 
 ---
 
@@ -461,11 +487,15 @@ ATLAS validates configuration at startup and rejects invalid combinations such a
 
 ---
 
-## 5. Run database migrations
+## 5. Run database migrations (non-Docker only)
 
 ```bash
 alembic upgrade head
 ```
+
+Only needed when running the control plane directly with `python -m
+atlas.control_plane.main` outside Docker — it also runs this
+automatically on startup, same as the Docker image does.
 
 ---
 
@@ -475,11 +505,11 @@ alembic upgrade head
 pytest -q
 ```
 
-Current verification:
+Current verification (requires a reachable PostgreSQL; otherwise the
+DB-backed tests skip):
 
 ```text
-198 passed
-1 skipped
+203 passed
 ```
 
 The full suite has been repeatedly executed with zero failures.
@@ -488,49 +518,39 @@ The full suite has been repeatedly executed with zero failures.
 
 # Running ATLAS
 
-## Control Plane
+## Production composition: the control plane
 
 ```bash
-python -m atlas.main
+python -m atlas.control_plane.main
 ```
 
-The control plane exposes the REST API and health/metrics endpoints.
+This is the one process a real deployment runs. It owns the single shared
+`GrpcWorkerRegistry` and starts, in order: a database-migration check
+(`alembic upgrade head`), the `atlas_worker` privilege grant, the gRPC
+server, `DispatchLoop` (Scheduler + Dispatcher), `FailureDetector`, and
+`RecoveryManager` — then serves the REST API. This is exactly what
+`docker compose up` runs as the `control-plane` service.
 
-Health check:
+Health check: `GET /health`. Metrics: `GET /metrics`.
 
-```text
-GET /health
-```
-
-Metrics:
-
-```text
-GET /metrics
-```
+`python -m atlas.main` (`uvicorn atlas.main:app`) still works for
+REST-only local development (e.g. exercising the Job API without a
+worker), but it does not start the gRPC server or any of the background
+loops — nothing will get dispatched.
 
 ---
 
 ## gRPC Server
 
-The gRPC server listens on the configured:
-
-```text
-GRPC_PORT
-```
-
-default:
-
-```text
-50051
-```
-
-Workers connect through the bidirectional `TaskChannel` stream.
+The gRPC server listens on the configured `GRPC_PORT` (default `50051`),
+started by the control plane above. Workers connect through the
+bidirectional `TaskChannel` stream.
 
 ---
 
 ## Worker
 
-A worker can run as a separate process using the gRPC worker entrypoint:
+A worker runs as its own process, talking to the control plane over gRPC:
 
 ```bash
 python -m atlas.worker.grpc_main
@@ -664,6 +684,7 @@ E2E scenarios cover:
 | Automatic task recovery | Yes |
 | Bounded retries | Yes |
 | Priority scheduling | Yes |
+| Job status aggregated from tasks | Yes (`QUEUED`→`RUNNING`→`COMPLETED`/`FAILED`) |
 | Remote worker execution | gRPC |
 | Stale-result protection | `(task_id, attempt)` |
 | Observability | Structured logs + metrics |
@@ -824,6 +845,17 @@ Current limitations include:
 - No application-level idempotency-key system.
 - Metrics are intentionally lightweight rather than a complete Prometheus/OpenTelemetry stack.
 - Worker database credential isolation is deployment-level hardening rather than a complete secrets-management solution.
+- `Dispatcher.dispatch_all()` delivers proposals from one scheduler cycle
+  sequentially, and each dispatch blocks the shared `DispatchLoop` thread
+  until that task's execution finishes (or, over gRPC, until the
+  310-second result wait times out). A single unresponsive worker
+  therefore delays scheduling for *other* proposals until that call
+  resolves. `FailureDetector`/`RecoveryManager` run as independent
+  threads and are unaffected — failure detection and retry-requeueing
+  still happen on their own ~`WORKER_TIMEOUT`-second schedule regardless.
+  This is invisible in the default single-worker topology and a real
+  constraint on multi-worker deployments; making dispatch concurrent
+  would be a genuine architecture change, not a wiring fix.
 
 These are explicit architectural boundaries, not hidden guarantees.
 
