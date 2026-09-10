@@ -15,35 +15,42 @@ from atlas.services import JobNotFoundError
 settings = get_settings()
 logger = setup_logging(settings.log_level)
 
-app = FastAPI(title="Atlas")
-app.include_router(jobs_router)
+
+def create_app(lifespan=None) -> FastAPI:
+    """Build the Atlas FastAPI app. `lifespan` is None for plain REST-only
+    use (tests, `make run`) and an async context manager for the production
+    control plane (atlas.control_plane.main), which needs startup/shutdown
+    hooks to own the gRPC server and background loops."""
+    app = FastAPI(title="Atlas", lifespan=lifespan)
+    app.include_router(jobs_router)
+
+    @app.exception_handler(JobNotFoundError)
+    def _job_not_found(request: Request, exc: JobNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(InvalidTransitionError)
+    def _invalid_transition(request: Request, exc: InvalidTransitionError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.get("/health")
+    def health() -> dict:
+        return {"status": "ok"}
+
+    @app.get("/metrics")
+    def metrics() -> dict:
+        """Simple, DB-derived counts — no in-memory state to drift from
+        PostgreSQL (the single source of truth, ADR-002). Not a Prometheus
+        exporter; see plans/phase-11-observability.md section 6."""
+        job_repo, task_repo, worker_repo = JobRepository(), TaskRepository(), WorkerRepository()
+        with session_scope() as session:
+            jobs = {status.value: len(job_repo.list_by_status(session, status)) for status in JobStatus}
+            tasks = {status.value: len(task_repo.list_by_status(session, status)) for status in TaskStatus}
+            workers = {
+                status.value: len(worker_repo.list_by_status(session, status)) for status in WorkerStatus
+            }
+        return {"jobs": jobs, "tasks": tasks, "workers": workers}
+
+    return app
 
 
-@app.exception_handler(JobNotFoundError)
-def _job_not_found(request: Request, exc: JobNotFoundError) -> JSONResponse:
-    return JSONResponse(status_code=404, content={"detail": str(exc)})
-
-
-@app.exception_handler(InvalidTransitionError)
-def _invalid_transition(request: Request, exc: InvalidTransitionError) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": str(exc)})
-
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
-
-
-@app.get("/metrics")
-def metrics() -> dict:
-    """Simple, DB-derived counts — no in-memory state to drift from
-    PostgreSQL (the single source of truth, ADR-002). Not a Prometheus
-    exporter; see plans/phase-11-observability.md section 6."""
-    job_repo, task_repo, worker_repo = JobRepository(), TaskRepository(), WorkerRepository()
-    with session_scope() as session:
-        jobs = {status.value: len(job_repo.list_by_status(session, status)) for status in JobStatus}
-        tasks = {status.value: len(task_repo.list_by_status(session, status)) for status in TaskStatus}
-        workers = {
-            status.value: len(worker_repo.list_by_status(session, status)) for status in WorkerStatus
-        }
-    return {"jobs": jobs, "tasks": tasks, "workers": workers}
+app = create_app()

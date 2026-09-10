@@ -16,33 +16,50 @@ services:
       timeout: 5s
       retries: 5
 
-  grpc-server:
+  # Owns the one shared GrpcWorkerRegistry: REST API, gRPC server,
+  # Scheduler/Dispatcher (via DispatchLoop), FailureDetector and
+  # RecoveryManager all run in this single process. See
+  # atlas.control_plane.main -- splitting these across separate
+  # processes/containers would give each its own in-memory registry and
+  # break dispatch entirely.
+  control-plane:
     build: .
-    command: python -m atlas.grpc_server.server
+    command: python -m atlas.control_plane.main
+    environment:
+      DATABASE_URL: postgresql://atlas:atlas_pass@postgres:5432/atlas_db
     env_file:
       - .env.example
     depends_on:
       postgres:
         condition: service_healthy
     ports:
+      - "8000:8000"
       - "50051:50051"
     volumes:
       - .:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   worker-1:
     build: .
     command: python -m atlas.worker.grpc_main
     environment:
-      ATLAS_GRPC_TARGET: grpc-server:50051
+      ATLAS_GRPC_TARGET: control-plane:50051
       # Least-privilege role (workers/tasks/task_attempts only, no jobs,
       # no DELETE) -- see docker/postgres-init/01-worker-role.sql and
-      # docker/grant-worker-privileges.sql. Overrides the shared
-      # DATABASE_URL from .env.example below.
+      # docker/grant-worker-privileges.sql (granted automatically by the
+      # control plane on startup). Overrides the shared DATABASE_URL from
+      # .env.example below.
       DATABASE_URL: postgresql://atlas_worker:atlas_worker_pass@postgres:5432/atlas_db
     env_file:
       - .env.example
     depends_on:
-      - grpc-server
+      control-plane:
+        condition: service_healthy
     volumes:
       - .:/app
 
