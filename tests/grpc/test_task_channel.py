@@ -170,6 +170,36 @@ def test_worker_not_connected_is_a_dispatch_failure(server_and_registry):
         _cleanup(job.id)
 
 
+def test_dispatch_does_not_null_out_last_heartbeat(server_and_registry):
+    # Regression: WorkerRuntime._assign()/_finish() write self.worker as a
+    # full row (last_heartbeat included) via WorkerRepository.update().
+    # GrpcWorkerClient sends heartbeats through a separate stub call, not
+    # WorkerRuntime.send_heartbeat() -- if it didn't also keep
+    # self.runtime.worker.last_heartbeat in sync locally, the first task a
+    # gRPC worker claims would silently overwrite the DB's real heartbeat
+    # with this process's stale None, making FailureDetector mark a
+    # perfectly healthy, actively-executing worker UNHEALTHY.
+    target, registry = server_and_registry
+    job, task = _make_job_and_task({"command": "exit 0"})
+    channel, client = _connect_client(target)
+    try:
+        with session_scope() as session:
+            before = WorkerRepository().get(session, client.worker.id)
+        assert before.last_heartbeat is not None
+
+        dispatcher = Dispatcher(registry)
+        result = dispatcher.dispatch(task, client.worker)
+        assert result.status == "dispatched"
+
+        with session_scope() as session:
+            after = WorkerRepository().get(session, client.worker.id)
+        assert after.last_heartbeat is not None
+    finally:
+        client.shutdown()
+        channel.close()
+        _cleanup(job.id, client.worker.id)
+
+
 def test_shutdown_closes_stream_and_worker_removed_from_registry(server_and_registry):
     target, registry = server_and_registry
     channel, client = _connect_client(target)

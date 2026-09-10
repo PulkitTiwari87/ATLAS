@@ -76,20 +76,38 @@ def test_limit_shell_resources_sets_rlimits_on_posix():
     # Runs for real only on POSIX (Linux/Mac CI, Docker); skips on this
     # Windows dev environment where `resource` doesn't exist — see
     # module docstring and src/atlas/worker/runtime.py's platform note.
-    import resource as _resource
+    #
+    # _limit_shell_resources() is a preexec_fn: production only ever calls
+    # it inside a forked child that's about to exec (subprocess.run), where
+    # a lowered *hard* limit dies with that child. Calling it directly in
+    # this test process would permanently lower this process's own hard
+    # limits instead — irreversible without CAP_SYS_RESOURCE, and fatal to
+    # every later test in the same pytest run once RLIMIT_AS is capped at
+    # 512MB for the rest of the suite. Exercise it the same way production
+    # does: inside an actual forked child, which discards the change on exit.
+    import os
 
-    original_cpu = _resource.getrlimit(_resource.RLIMIT_CPU)
-    original_as = _resource.getrlimit(_resource.RLIMIT_AS)
-    try:
-        _limit_shell_resources()
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        import resource as _resource
 
-        cpu_limit = _resource.getrlimit(_resource.RLIMIT_CPU)
-        as_limit = _resource.getrlimit(_resource.RLIMIT_AS)
-        assert cpu_limit[0] == 300
-        assert as_limit[0] == 512 * 1024 * 1024
-    finally:
-        _resource.setrlimit(_resource.RLIMIT_CPU, original_cpu)
-        _resource.setrlimit(_resource.RLIMIT_AS, original_as)
+        try:
+            _limit_shell_resources()
+            cpu_limit = _resource.getrlimit(_resource.RLIMIT_CPU)
+            as_limit = _resource.getrlimit(_resource.RLIMIT_AS)
+            ok = cpu_limit[0] == 300 and as_limit[0] == 512 * 1024 * 1024
+        except Exception:
+            ok = False
+        os.write(write_fd, b"1" if ok else b"0")
+        os._exit(0)
+
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    os.waitpid(pid, 0)
+    assert result == b"1"
 
 
 # --- Integration tests: real Postgres, real WorkerRuntime ---

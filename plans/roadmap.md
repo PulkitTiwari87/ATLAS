@@ -19,9 +19,16 @@ Atlas is implemented incrementally to preserve correctness and keep each change 
 - Phase 12 — Integration + E2E Testing ([plan](phase-12-integration-e2e.md))
 - Phase 13 — Hardening ([plan](phase-13-hardening.md))
 
-Phases 07–13 are planned but not yet approved for implementation; each
-plan explicitly flags the design decisions that need confirmation before
-its phase begins (see each plan's "Risks and Design Decisions" section).
+Phases 00–13 are implemented and tested (203 tests). Production wiring —
+composing Scheduler, Dispatcher, FailureDetector, and RecoveryManager
+with the gRPC server behind one shared `GrpcWorkerRegistry`
+(`atlas.control_plane.main`), plus Docker Compose actually running that
+composition — was closed out as a follow-up integration pass; see
+`docs/decisions/ADR-001-control-plane.md` and the README's "Running
+ATLAS" section. Job-status aggregation (`QUEUED`→`RUNNING`→
+`COMPLETED`/`FAILED`), flagged in `plans/phase-04-worker-runtime.md`
+section 18 as deferred until an actual multi-task job was flowing
+end-to-end, was implemented in `Scheduler` as part of the same pass.
 
 ## Dependency Flow
 
