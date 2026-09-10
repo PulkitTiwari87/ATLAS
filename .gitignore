@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.env
+.idea/
+*.swp
+.DS_Store
+.dist/
+build/
+*.egg-info/

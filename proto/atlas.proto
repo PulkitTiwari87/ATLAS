@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package atlas;
+
+// WorkerService: worker <-> control plane transport (Phase 10).
+//
+// RegisterWorker and Heartbeat are worker-initiated unary calls, matching
+// docs/api/grpc-api.md exactly. TaskChannel is a Phase 10 addition to that
+// documented contract (not a rewrite of it) — it exists because dispatch is
+// control-plane-initiated (the Dispatcher decides and pushes), and plain
+// unary gRPC cannot have the server call the client unprompted. The worker
+// opens TaskChannel once and keeps it open for its lifetime; the server
+// pushes a DispatchTask down it whenever Dispatcher.dispatch() decides to,
+// and the worker reports back a TaskResult on the same stream once
+// WorkerRuntime.execute_task() (unchanged) returns.
+//
+// See plans/phase-10-grpc.md section 4.
+service WorkerService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc TaskChannel(stream WorkerMessage) returns (stream ServerMessage);
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;  // client-generated (Worker.id is assigned client-side, Phase 04)
+  string hostname = 2;
+  string address = 3;
+}
+
+message RegisterWorkerResponse {
+  string worker_id = 1;  // echoes the request's worker_id, confirming registration
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  string timestamp = 2;  // ISO 8601
+}
+
+message HeartbeatResponse {}
+
+// task_type/payload are deliberately not carried here: the worker re-fetches
+// the task fresh from PostgreSQL as the first step of execute_task() (Phase
+// 04, unchanged) — exactly as the local-mode Dispatcher already does by
+// passing only a task_id. Sending them again here would be redundant,
+// possibly-stale data.
+//
+// attempt correlates this dispatch to the execution it will produce
+// (Task.attempt, incremented once per RUNNING entry by WorkerRuntime._start,
+// Phase 04/09 — the existing execution identity, reused rather than
+// inventing a new one). It is computed server-side as
+// current_task.attempt + 1 immediately before sending, and echoed back
+// unchanged in TaskResult.attempt so a late result from an earlier
+// execution can never satisfy a later execution's waiter — see
+// src/atlas/grpc_server/registry.py.
+message DispatchTask {
+  string task_id = 1;
+  int64 attempt = 2;
+}
+
+// Purely informational (plans/phase-10-grpc.md section 6) — the worker's own
+// WorkerRuntime.execute_task() already persisted the real outcome (status,
+// TaskAttempt) directly to PostgreSQL before this is sent. This message only
+// lets the control-plane's in-memory dispatch bookkeeping know whether
+// delivery completed or was skipped (stale proposal, draining, etc.).
+//
+// attempt echoes the DispatchTask.attempt that triggered this execution —
+// see DispatchTask's comment above.
+message TaskResult {
+  string task_id = 1;
+  int64 attempt = 2;
+  bool skipped = 3;
+  string error = 4;
+}
+
+message WorkerMessage {
+  string worker_id = 1;
+  TaskResult result = 2;  // present only when reporting a result
+}
+
+message ServerMessage {
+  DispatchTask dispatch = 1;  // present only when dispatching a task
+}

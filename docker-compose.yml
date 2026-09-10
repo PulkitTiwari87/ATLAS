@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas_pass
+      POSTGRES_DB: atlas_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "atlas"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grpc-server:
+    build: .
+    command: python -m atlas.grpc_server.server
+    env_file:
+      - .env.example
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    volumes:
+      - .:/app
+
+  worker-1:
+    build: .
+    command: python -m atlas.worker.grpc_main
+    environment:
+      ATLAS_GRPC_TARGET: grpc-server:50051
+      # Least-privilege role (workers/tasks/task_attempts only, no jobs,
+      # no DELETE) -- see docker/postgres-init/01-worker-role.sql and
+      # docker/grant-worker-privileges.sql. Overrides the shared
+      # DATABASE_URL from .env.example below.
+      DATABASE_URL: postgresql://atlas_worker:atlas_worker_pass@postgres:5432/atlas_db
+    env_file:
+      - .env.example
+    depends_on:
+      - grpc-server
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:
