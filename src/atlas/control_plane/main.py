@@ -77,18 +77,16 @@ def _grant_worker_privileges() -> None:
     A local/non-Docker deployment without that role is not an error."""
     if not _GRANT_SQL_PATH.exists():
         return
-    # Strip whole comment lines *before* splitting on ";" -- one of this
-    # file's own comments contains a literal semicolon mid-sentence
-    # ("...then; see..."), so splitting first would cut a comment in half
-    # and feed the back half to Postgres as a statement.
-    sql_lines = [
-        line for line in _GRANT_SQL_PATH.read_text().splitlines() if not line.strip().startswith("--")
-    ]
-    statements = [stmt.strip() for stmt in "\n".join(sql_lines).split(";") if stmt.strip()]
+    # Hand the whole file to Postgres as one multi-statement script instead
+    # of hand-parsing it: psycopg2 sends an unparameterized text() query via
+    # the simple query protocol, which -- like `psql -f` -- lets Postgres's
+    # own SQL parser split statements and strip comments. That's what
+    # actually understands SQL comment syntax; a "does this line start with
+    # --" filter doesn't (this file has a comment containing a literal ';',
+    # which previously broke a split-on-";" version of this function).
     try:
         with _engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
+            conn.execute(text(_GRANT_SQL_PATH.read_text()))
         logger.info("Granted atlas_worker table privileges")
     except ProgrammingError as exc:
         logger.warning("Skipping worker privilege grant (atlas_worker role not present): %s", exc)
