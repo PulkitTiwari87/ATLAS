@@ -183,3 +183,67 @@ def test_execute_task_still_works_after_scheduler_cycle():
         assert result.status == TaskStatus.SUCCEEDED
     finally:
         _cleanup(job_id=job.id, worker_id=runtime.worker.id)
+
+
+def test_job_status_aggregates_to_completed_when_all_tasks_succeed():
+    job, task = _make_job_with_task()
+    runtime = WorkerRuntime()
+    runtime.register()
+    try:
+        scheduler = Scheduler()
+        scheduler.run_cycle()  # SUBMITTED -> QUEUED
+
+        runtime.execute_task(task.id)  # task -> SUCCEEDED
+        scheduler.run_cycle()  # should aggregate job -> COMPLETED
+
+        with session_scope() as session:
+            fetched_job = JobRepository().get(session, job.id)
+        assert fetched_job.status == JobStatus.COMPLETED
+    finally:
+        _cleanup(job_id=job.id, worker_id=runtime.worker.id)
+
+
+def test_job_status_aggregates_to_failed_when_a_task_fails_permanently():
+    job = Job(name="scheduler-fail-job")
+    task = Task(job_id=job.id, type="shell", payload={"command": "exit 1"}, max_retries=0)
+    with session_scope() as session:
+        JobRepository().add(session, job)
+        TaskRepository().add(session, task)
+    runtime = WorkerRuntime()
+    runtime.register()
+    try:
+        scheduler = Scheduler()
+        scheduler.run_cycle()
+
+        runtime.execute_task(task.id)  # task -> FAILED (no retries)
+        scheduler.run_cycle()
+
+        with session_scope() as session:
+            fetched_job = JobRepository().get(session, job.id)
+        assert fetched_job.status == JobStatus.FAILED
+    finally:
+        _cleanup(job_id=job.id, worker_id=runtime.worker.id)
+
+
+def test_job_status_becomes_running_while_tasks_are_still_pending():
+    job = Job(name="scheduler-partial-job")
+    running_task = Task(job_id=job.id, type="shell", payload={"command": "exit 0"})
+    pending_task = Task(job_id=job.id, type="shell", payload={"command": "exit 0"})
+    with session_scope() as session:
+        JobRepository().add(session, job)
+        TaskRepository().add(session, running_task)
+        TaskRepository().add(session, pending_task)
+    runtime = WorkerRuntime()
+    runtime.register()
+    try:
+        scheduler = Scheduler()
+        scheduler.run_cycle()
+
+        runtime.execute_task(running_task.id)  # one task done, one still PENDING
+        scheduler.run_cycle()
+
+        with session_scope() as session:
+            fetched_job = JobRepository().get(session, job.id)
+        assert fetched_job.status == JobStatus.RUNNING
+    finally:
+        _cleanup(job_id=job.id, worker_id=runtime.worker.id)
